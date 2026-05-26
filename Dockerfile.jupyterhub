@@ -1,0 +1,84 @@
+# syntax=docker/dockerfile:1
+# check=skip=FromPlatformFlagConstDisallowed
+# JupyterHub-compatible Dockerfile for sweets.
+# Layers sweets + dask onto jupyter/base-notebook for BYOI JupyterHub deployments.
+#
+# Build:
+#   docker build -f Dockerfile.jupyterhub -t ghcr.io/whatnick/sweets:jupyterhub .
+#
+# Run standalone:
+#   docker run --rm -p 8888:8888 ghcr.io/whatnick/sweets:jupyterhub
+
+# ---------------------------------------------------------------------------
+# Stage 1: Install sweets dependencies using pixi
+# ---------------------------------------------------------------------------
+FROM --platform=linux/amd64 ghcr.io/prefix-dev/pixi:0.65.0 AS install
+
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+ARG VERSION=0.0.0.dev0
+ENV SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SWEETS=${VERSION}
+
+COPY pyproject.toml pixi.lock LICENSE README.md ./
+RUN mkdir -p src/sweets && touch src/sweets/__init__.py
+
+RUN --mount=type=cache,target=/root/.cache/rattler/cache,sharing=private \
+    pixi install -e default
+
+# ---------------------------------------------------------------------------
+# Stage 2: Build sweets
+# ---------------------------------------------------------------------------
+FROM install AS build
+
+ARG VERSION=0.0.0.dev0
+ENV SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SWEETS=${VERSION}
+
+COPY . .
+
+RUN --mount=type=cache,target=/root/.cache/rattler/cache,sharing=private \
+    pixi install -e default
+
+RUN pixi shell-hook -e default > /activate.sh && \
+    chmod +x /activate.sh
+
+# ---------------------------------------------------------------------------
+# Stage 3: JupyterHub-compatible image based on jupyter/base-notebook
+# ---------------------------------------------------------------------------
+FROM --platform=linux/amd64 quay.io/jupyter/base-notebook:latest AS production
+
+LABEL org.opencontainers.image.description="JupyterHub-compatible sweets InSAR image with dask"
+LABEL org.opencontainers.image.authors="whatnick"
+LABEL org.opencontainers.image.url="https://github.com/whatnick/sweets"
+LABEL org.opencontainers.image.source="https://github.com/whatnick/sweets"
+LABEL org.opencontainers.image.licenses="BSD-3-Clause OR Apache-2.0"
+
+USER root
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the pixi environment from build stage
+COPY --from=build /app/.pixi/envs/default /app/.pixi/envs/default
+COPY --from=build /app/src /app/src
+COPY --from=build /activate.sh /activate.sh
+
+# Install dask + distributed into the conda/jupyter environment
+RUN mamba install -y -n base -c conda-forge dask distributed dask-labextension \
+    && mamba clean -afy
+
+# Make sweets available by adding pixi env to PATH and registering as a Jupyter kernel
+RUN /activate.sh python -m ipykernel install --name sweets --display-name "Python (sweets)" \
+    || true
+
+# Create activation profile so sweets CLI is on PATH in terminals
+RUN echo 'source /activate.sh' >> /etc/profile.d/sweets.sh
+
+# Ensure the sweets pixi env bin is on PATH for notebook kernels
+ENV PATH="/app/.pixi/envs/default/bin:${PATH}"
+
+USER ${NB_UID}
+WORKDIR /home/${NB_USER}
